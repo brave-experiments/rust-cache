@@ -49,9 +49,15 @@ inputs:
     required: false
     default: "true"
   cache-provider:
-    description: "Determines which provider to use for caching. Options are github, buildjet, or warpbuild. Defaults to github."
+    description: "Determines which provider to use for caching. Options are github, buildjet, warpbuild, or s3. Defaults to github."
     required: false
     default: "github"
+  s3-bucket:
+    description: "S3 bucket name for caching when cache-provider is s3."
+    required: false
+  s3-region:
+    description: "AWS region for the S3 bucket. Falls back to AWS_REGION / AWS_DEFAULT_REGION env vars."
+    required: false
   cache-bin:
     description: "Determines whether to cache ${CARGO_HOME}/bin."
     required: false
