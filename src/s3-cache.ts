@@ -71,7 +71,7 @@ export async function saveCache(paths: string[], key: string): Promise<string> {
   const bucket = getBucket();
   const client = getS3Client();
 
-  const tar = spawn("tar", ["-czf", "-", "-P", "--", ...paths], {
+  const tar = spawn("tar", ["-czf", "-", "-C", "/", "--", ...paths], {
     stdio: ["ignore", "pipe", "inherit"],
   });
 
@@ -120,7 +120,7 @@ async function downloadAndExtract(
   }
 
   await new Promise<void>((resolve, reject) => {
-    const tar = spawn("tar", ["-xzf", "-", "-P"], {
+    const tar = spawn("tar", ["-xzf", "-", "-C", "/"], {
       stdio: ["pipe", "inherit", "inherit"],
     });
 
