@@ -1,20 +1,21 @@
 import * as core from "@actions/core";
-import {
-  GetObjectCommand,
-  HeadObjectCommand,
-  ListObjectsV2Command,
-  S3Client,
-} from "@aws-sdk/client-s3";
-import { Upload } from "@aws-sdk/lib-storage";
+import awsLite from "@aws-lite/client";
+// @ts-ignore
+import awsS3 from "@aws-lite/s3";
 import { spawn } from "child_process";
 import { Readable, Transform } from "stream";
 
-function getS3Client(): S3Client {
-  const region =
-    core.getInput("s3-region") ||
-    process.env.AWS_REGION ||
-    process.env.AWS_DEFAULT_REGION;
-  return new S3Client({ region });
+let _client: any = null;
+
+async function getClient() {
+  if (!_client) {
+    const region =
+      core.getInput("s3-region") ||
+      process.env.AWS_REGION ||
+      process.env.AWS_DEFAULT_REGION;
+    _client = await awsLite({ region, plugins: [awsS3] });
+  }
+  return _client;
 }
 
 export function getBucket(): string {
@@ -31,37 +32,32 @@ export async function restoreCache(
   restoreKeys?: string[],
   options?: { lookupOnly?: boolean },
 ): Promise<string | undefined> {
+  void paths;
   const bucket = getBucket();
-  const client = getS3Client();
+  const aws = await getClient();
 
   // Try exact primary key first, then each restore key (prefix match)
-  const exactKeys = [primaryKey];
-  const prefixKeys = restoreKeys ?? [];
+  for (const key of [primaryKey, ...(restoreKeys ?? [])]) {
+    let matchedKey: string | undefined;
 
-  for (const key of exactKeys) {
     try {
-      await client.send(new HeadObjectCommand({ Bucket: bucket, Key: key }));
-      if (!options?.lookupOnly) {
-        await downloadAndExtract(client, bucket, key, paths);
-      }
-      return key;
+      await aws.S3.HeadObject({ Bucket: bucket, Key: key });
+      matchedKey = key;
     } catch {
-      // not found, continue
+      // Not an exact match — try prefix listing
+      const result = await aws.S3.ListObjectsV2({ Bucket: bucket, Prefix: key, MaxKeys: 1 });
+      const obj = result.Contents?.[0];
+      if (obj?.Key) {
+        matchedKey = obj.Key;
+      }
     }
-  }
 
-  for (const prefix of prefixKeys) {
-    const result = await client.send(
-      new ListObjectsV2Command({ Bucket: bucket, Prefix: prefix, MaxKeys: 1 }),
-    );
-    const obj = result.Contents?.[0];
-    if (!obj?.Key) {
-      continue;
-    }
+    if (!matchedKey) continue;
+
     if (!options?.lookupOnly) {
-      await downloadAndExtract(client, bucket, obj.Key, paths);
+      await downloadAndExtract(aws, bucket, matchedKey);
     }
-    return obj.Key;
+    return matchedKey;
   }
 
   return undefined;
@@ -69,55 +65,47 @@ export async function restoreCache(
 
 export async function saveCache(paths: string[], key: string): Promise<string> {
   const bucket = getBucket();
-  const client = getS3Client();
+  const aws = await getClient();
 
   const tar = spawn("tar", ["-czf", "-", "-C", "/", "--", ...paths], {
     stdio: ["ignore", "pipe", "inherit"],
   });
 
-  const upload = new Upload({
-    client,
-    params: {
-      Bucket: bucket,
-      Key: key,
-      Body: tar.stdout as Readable,
+  let uploaded = 0;
+  const progress = new Transform({
+    transform(chunk, _encoding, callback) {
+      uploaded += chunk.length;
+      callback(null, chunk);
     },
   });
 
-  upload.on("httpUploadProgress", (progress) => {
-    const mb = ((progress.loaded ?? 0) / (1024 * 1024)).toFixed(1);
-    core.info(`Uploading cache... ${mb} MB uploaded (part ${progress.part})`);
-  });
+  const interval = setInterval(() => {
+    const mb = (uploaded / (1024 * 1024)).toFixed(1);
+    core.info(`Uploading cache... ${mb} MB`);
+  }, 1000);
 
-  await upload.done();
+  try {
+    await aws.S3.Upload({ Bucket: bucket, Key: key, Body: tar.stdout.pipe(progress) });
+  } finally {
+    clearInterval(interval);
+  }
 
   await new Promise<void>((resolve, reject) => {
-    tar.on("close", (code) => {
-      if (code === 0) {
-        resolve();
-      } else {
-        reject(new Error(`tar exited with code ${code}`));
-      }
-    });
+    tar.on("close", (code) =>
+      code === 0 ? resolve() : reject(new Error(`tar exited with code ${code}`)),
+    );
     tar.on("error", reject);
   });
 
   return key;
 }
 
-async function downloadAndExtract(
-  client: S3Client,
-  bucket: string,
-  key: string,
-  _paths: string[],
-): Promise<void> {
+async function downloadAndExtract(aws: any, bucket: string, key: string): Promise<void> {
   core.info(`Downloading from S3 bucket "${bucket}", key "${key}"`);
-  const response = await client.send(new GetObjectCommand({ Bucket: bucket, Key: key }));
-  core.info(`Content-Length: ${response.ContentLength} bytes`);
 
-  if (!response.Body) {
-    throw new Error(`Empty response body for key: ${key}`);
-  }
+  const response = await aws.S3.GetObject({ Bucket: bucket, Key: key, streamResponsePayload: true });
+  const stream = response.Body as Readable;
+  core.info(`Content-Length: ${response.ContentLength} bytes`);
 
   await new Promise<void>((resolve, reject) => {
     const tar = spawn("tar", ["-xzf", "-", "-C", "/"], {
@@ -143,16 +131,12 @@ async function downloadAndExtract(
       },
     });
 
-    (response.Body as Readable).pipe(progress).pipe(tar.stdin);
+    stream.pipe(progress).pipe(tar.stdin);
 
-    tar.on("close", (code) => {
-      if (code === 0) {
-        resolve();
-      } else {
-        reject(new Error(`tar exited with code ${code}`));
-      }
-    });
+    tar.on("close", (code) =>
+      code === 0 ? resolve() : reject(new Error(`tar exited with code ${code}`)),
+    );
     tar.on("error", reject);
-    (response.Body as Readable).on("error", reject);
+    stream.on("error", reject);
   });
 }
