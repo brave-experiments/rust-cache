@@ -3,7 +3,14 @@ import awsLite from "@aws-lite/client";
 // @ts-ignore
 import awsS3 from "@aws-lite/s3";
 import { spawn } from "child_process";
-import { Readable, Transform } from "stream";
+import { promises as fs } from "fs";
+import { tmpdir } from "os";
+import { join } from "path";
+
+const DOWNLOAD_CONCURRENCY = 32;
+const DOWNLOAD_PART_SIZE = 16 * 1024 * 1024; // 16 MB
+const UPLOAD_PART_SIZE = 32 * 1024 * 1024; // 32 MB
+const UPLOAD_CONCURRENCY = 4;
 
 let _client: any = null;
 
@@ -67,76 +74,145 @@ export async function saveCache(paths: string[], key: string): Promise<string> {
   const bucket = getBucket();
   const aws = await getClient();
 
-  const tar = spawn("tar", ["-czf", "-", "-C", "/", "--", ...paths], {
-    stdio: ["ignore", "pipe", "inherit"],
-  });
-
-  let uploaded = 0;
-  const progress = new Transform({
-    transform(chunk, _encoding, callback) {
-      uploaded += chunk.length;
-      callback(null, chunk);
-    },
-  });
-
-  const interval = setInterval(() => {
-    const mb = (uploaded / (1024 * 1024)).toFixed(1);
-    core.info(`Uploading cache... ${mb} MB`);
-  }, 1000);
-
+  const tmpFile = join(tmpdir(), `rust-cache-upload-${Date.now()}.tar.zst`);
   try {
-    await aws.S3.Upload({ Bucket: bucket, Key: key, Body: tar.stdout.pipe(progress) });
+    // Write tar+zstd to temp file
+    await new Promise<void>((resolve, reject) => {
+      const tar = spawn(
+        "tar",
+        ["--use-compress-program=zstd -T0 -1", "-cf", tmpFile, "-C", "/", "--", ...paths],
+        { stdio: ["ignore", "inherit", "inherit"] },
+      );
+      tar.on("close", (code) =>
+        code === 0 ? resolve() : reject(new Error(`tar exited with code ${code}`)),
+      );
+      tar.on("error", reject);
+    });
+
+    const { size } = await fs.stat(tmpFile);
+    core.info(`Uploading cache (${(size / (1024 * 1024)).toFixed(1)} MB) to S3...`);
+
+    let uploaded = 0;
+    const interval = setInterval(() => {
+      const mb = (uploaded / (1024 * 1024)).toFixed(1);
+      core.info(`Uploading cache... ${mb} MB`);
+    }, 1000);
+
+    try {
+      // @aws-lite/s3 Upload supports File path + ChunkSize + Concurrency for multipart
+      await aws.S3.Upload({
+        Bucket: bucket,
+        Key: key,
+        File: tmpFile,
+        ChunkSize: UPLOAD_PART_SIZE,
+        Concurrency: UPLOAD_CONCURRENCY,
+      });
+    } finally {
+      clearInterval(interval);
+    }
   } finally {
-    clearInterval(interval);
+    await fs.unlink(tmpFile).catch(() => {});
   }
 
-  await new Promise<void>((resolve, reject) => {
-    tar.on("close", (code) =>
-      code === 0 ? resolve() : reject(new Error(`tar exited with code ${code}`)),
-    );
-    tar.on("error", reject);
-  });
-
   return key;
+}
+
+async function getObjectSize(aws: any, bucket: string, key: string): Promise<number> {
+  // Range: bytes=0-0 to get ContentRange with total size
+  const resp = await aws.S3.GetObject({
+    Bucket: bucket,
+    Key: key,
+    Range: "bytes=0-0",
+    rawResponsePayload: true,
+  });
+  // ContentRange: "bytes 0-0/TOTAL"
+  const match = String(resp.ContentRange ?? "").match(/\/(\d+)$/);
+  if (!match) throw new Error(`Unexpected ContentRange: ${resp.ContentRange}`);
+  return parseInt(match[1], 10);
 }
 
 async function downloadAndExtract(aws: any, bucket: string, key: string): Promise<void> {
   core.info(`Downloading from S3 bucket "${bucket}", key "${key}"`);
 
-  const response = await aws.S3.GetObject({ Bucket: bucket, Key: key, streamResponsePayload: true });
-  const stream = response.Body as Readable;
-  core.info(`Content-Length: ${response.ContentLength} bytes`);
+  const totalSize = await getObjectSize(aws, bucket, key);
+  core.info(`Object size: ${(totalSize / (1024 * 1024)).toFixed(1)} MB`);
 
-  await new Promise<void>((resolve, reject) => {
-    const tar = spawn("tar", ["-xzf", "-", "-C", "/"], {
-      stdio: ["pipe", "inherit", "inherit"],
-    });
+  const tmpFile = join(tmpdir(), `rust-cache-download-${Date.now()}.tar.zst`);
 
+  try {
+    // Pre-allocate the file
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const p = spawn("fallocate", ["-l", String(totalSize), tmpFile]);
+        p.on("close", (code) => (code === 0 ? resolve() : reject()));
+        p.on("error", reject);
+      });
+    } catch {
+      // fallocate not available (e.g. macOS) — fall back to creating an empty file
+      await fs.writeFile(tmpFile, Buffer.alloc(0));
+    }
+
+    // Download all chunks concurrently
+    const numParts = Math.ceil(totalSize / DOWNLOAD_PART_SIZE);
     let downloaded = 0;
-    let lastLog = 0;
+    let lastLog = Date.now();
     let lastBytes = 0;
-    const progress = new Transform({
-      transform(chunk, _encoding, callback) {
-        downloaded += chunk.length;
-        const now = Date.now();
-        if (now - lastLog >= 1000) {
-          const elapsed = (now - lastLog) / 1000;
-          const mb = (downloaded / (1024 * 1024)).toFixed(1);
-          const mbps = ((downloaded - lastBytes) / (1024 * 1024) / elapsed).toFixed(1);
-          core.info(`Downloading cache... ${mb} MB (${mbps} MB/s)`);
-          lastLog = now;
-          lastBytes = downloaded;
-        }
-        callback(null, chunk);
-      },
+
+    const logProgress = () => {
+      const now = Date.now();
+      if (now - lastLog >= 1000) {
+        const elapsed = (now - lastLog) / 1000;
+        const mb = (downloaded / (1024 * 1024)).toFixed(1);
+        const mbps = ((downloaded - lastBytes) / (1024 * 1024) / elapsed).toFixed(1);
+        core.info(`Downloading cache... ${mb} MB (${mbps} MB/s)`);
+        lastLog = now;
+        lastBytes = downloaded;
+      }
+    };
+
+    const fh = await fs.open(tmpFile, "r+");
+    try {
+      // Process parts in batches of DOWNLOAD_CONCURRENCY
+      for (let batch = 0; batch < numParts; batch += DOWNLOAD_CONCURRENCY) {
+        const batchEnd = Math.min(batch + DOWNLOAD_CONCURRENCY, numParts);
+        await Promise.all(
+          Array.from({ length: batchEnd - batch }, (_, i) => {
+            const part = batch + i;
+            const start = part * DOWNLOAD_PART_SIZE;
+            const end = Math.min(start + DOWNLOAD_PART_SIZE - 1, totalSize - 1);
+            return aws.S3.GetObject({
+              Bucket: bucket,
+              Key: key,
+              Range: `bytes=${start}-${end}`,
+              rawResponsePayload: true,
+            }).then((resp: any) => {
+              const buf: Buffer = resp.Body;
+              downloaded += buf.length;
+              logProgress();
+              return fh.write(buf, 0, buf.length, start);
+            });
+          }),
+        );
+      }
+    } finally {
+      await fh.close();
+    }
+
+    core.info(`Download complete: ${(downloaded / (1024 * 1024)).toFixed(1)} MB`);
+
+    // Extract
+    await new Promise<void>((resolve, reject) => {
+      const tar = spawn(
+        "tar",
+        ["--use-compress-program=zstd -d", "-xf", tmpFile, "-C", "/"],
+        { stdio: ["ignore", "inherit", "inherit"] },
+      );
+      tar.on("close", (code) =>
+        code === 0 ? resolve() : reject(new Error(`tar exited with code ${code}`)),
+      );
+      tar.on("error", reject);
     });
-
-    stream.pipe(progress).pipe(tar.stdin);
-
-    tar.on("close", (code) =>
-      code === 0 ? resolve() : reject(new Error(`tar exited with code ${code}`)),
-    );
-    tar.on("error", reject);
-    stream.on("error", reject);
-  });
+  } finally {
+    await fs.unlink(tmpFile).catch(() => {});
+  }
 }
