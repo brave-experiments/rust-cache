@@ -10,7 +10,7 @@ import { join } from "path";
 const DOWNLOAD_CONCURRENCY = 32;
 const DOWNLOAD_PART_SIZE = 16 * 1024 * 1024; // 16 MB
 const UPLOAD_PART_SIZE = 32 * 1024 * 1024; // 32 MB
-const UPLOAD_CONCURRENCY = 4;
+const UPLOAD_CONCURRENCY = 32;
 
 let _client: any = null;
 
@@ -92,29 +92,80 @@ export async function saveCache(paths: string[], key: string): Promise<string> {
     const { size } = await fs.stat(tmpFile);
     core.info(`Uploading cache (${(size / (1024 * 1024)).toFixed(1)} MB) to S3...`);
 
-    let uploaded = 0;
-    const interval = setInterval(() => {
-      const mb = (uploaded / (1024 * 1024)).toFixed(1);
-      core.info(`Uploading cache... ${mb} MB`);
-    }, 1000);
+    await parallelUpload(aws, bucket, key, tmpFile, size);
 
-    try {
-      // @aws-lite/s3 Upload supports File path + ChunkSize + Concurrency for multipart
-      await aws.S3.Upload({
-        Bucket: bucket,
-        Key: key,
-        File: tmpFile,
-        ChunkSize: UPLOAD_PART_SIZE,
-        Concurrency: UPLOAD_CONCURRENCY,
-      });
-    } finally {
-      clearInterval(interval);
-    }
+    core.info(`Upload complete.`);
   } finally {
     await fs.unlink(tmpFile).catch(() => {});
   }
 
   return key;
+}
+
+async function parallelUpload(
+  aws: any,
+  bucket: string,
+  key: string,
+  filePath: string,
+  fileSize: number,
+): Promise<void> {
+  const { UploadId } = await aws.S3.CreateMultipartUpload({ Bucket: bucket, Key: key });
+
+  const numParts = Math.ceil(fileSize / UPLOAD_PART_SIZE);
+  let uploaded = 0;
+  let lastLog = Date.now();
+  let lastBytes = 0;
+
+  const logProgress = () => {
+    const now = Date.now();
+    if (now - lastLog >= 1000) {
+      const elapsed = (now - lastLog) / 1000;
+      const mb = (uploaded / (1024 * 1024)).toFixed(1);
+      const mbps = ((uploaded - lastBytes) / (1024 * 1024) / elapsed).toFixed(1);
+      core.info(`Uploading cache... ${mb} MB (${mbps} MB/s)`);
+      lastLog = now;
+      lastBytes = uploaded;
+    }
+  };
+
+  const parts: { PartNumber: number; ETag: string }[] = new Array(numParts);
+  const fh = await fs.open(filePath, "r");
+  try {
+    for (let batch = 0; batch < numParts; batch += UPLOAD_CONCURRENCY) {
+      const batchEnd = Math.min(batch + UPLOAD_CONCURRENCY, numParts);
+      await Promise.all(
+        Array.from({ length: batchEnd - batch }, async (_, i) => {
+          const partNum = batch + i + 1; // S3 part numbers are 1-based
+          const start = (partNum - 1) * UPLOAD_PART_SIZE;
+          const chunkSize = Math.min(UPLOAD_PART_SIZE, fileSize - start);
+          const buf = Buffer.allocUnsafe(chunkSize);
+          await fh.read(buf, 0, chunkSize, start);
+          const resp = await aws.S3.UploadPart({
+            Bucket: bucket,
+            Key: key,
+            UploadId,
+            PartNumber: partNum,
+            Body: buf,
+          });
+          uploaded += chunkSize;
+          logProgress();
+          parts[partNum - 1] = { PartNumber: partNum, ETag: resp.ETag };
+        }),
+      );
+    }
+  } catch (err) {
+    await aws.S3.AbortMultipartUpload({ Bucket: bucket, Key: key, UploadId }).catch(() => {});
+    throw err;
+  } finally {
+    await fh.close();
+  }
+
+  await aws.S3.CompleteMultipartUpload({
+    Bucket: bucket,
+    Key: key,
+    UploadId,
+    MultipartUpload: { Parts: parts },
+  });
 }
 
 async function getObjectSize(aws: any, bucket: string, key: string): Promise<number> {
