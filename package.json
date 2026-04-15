@@ -31,14 +31,14 @@
     "@actions/warpbuild-cache": "npm:github-actions.warp-cache@1.4.7",
     "@aws-lite/client": "^0.23.5",
     "@aws-lite/s3": "^0.2.6",
-    "smol-toml": "^1.6.0"
+    "smol-toml": "^1.6.1"
   },
   "devDependencies": {
     "@aws-lite/s3-types": "^0.2.7",
     "@types/node": "^25.4.0",
     "@vercel/ncc": "^0.38.4",
     "linefix": "^0.1.1",
-    "typescript": "5.9.3"
+    "typescript": "6.0.2"
   },
   "scripts": {
     "prepare": "ncc build --target es2020 -o dist/restore src/restore.ts && ncc build --target es2020 -o dist/save src/save.ts && linefix dist"
