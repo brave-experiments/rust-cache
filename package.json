@@ -42,5 +42,9 @@
   },
   "scripts": {
     "prepare": "ncc build --target es2020 -o dist/restore src/restore.ts && ncc build --target es2020 -o dist/save src/save.ts && linefix dist"
+  },
+  "overrides": {
+    "undici": "^6.25.0",
+    "@tootallnate/once": "^3.0.1"
   }
 }
