@@ -20,6 +20,18 @@ async function getClient() {
       core.getInput("s3-region") ||
       process.env.AWS_REGION ||
       process.env.AWS_DEFAULT_REGION;
+
+    // aws-lite throws "Profile not found: default" when an ambient ~/.aws/{config,credentials}
+    // exists without a [default] profile, which blocks the instance-role (IMDS) path CI runners
+    // use. Point it at a non-existent file (unless the user opted into one) so it falls through.
+    const noFile = join(tmpdir(), "rust-cache-no-aws-config");
+    if (!process.env.AWS_SHARED_CREDENTIALS_FILE) {
+      process.env.AWS_SHARED_CREDENTIALS_FILE = noFile;
+    }
+    if (!process.env.AWS_CONFIG_FILE) {
+      process.env.AWS_CONFIG_FILE = noFile;
+    }
+
     _client = await awsLite({ region, plugins: [awsS3] });
   }
   return _client;
